@@ -1,0 +1,27 @@
+# Emergency Assist AI — Python Dependencies
+# Install with:  pip install -r requirements.txt
+
+# ── Core UI ──────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Replicate API ─────────────────────────────────────────────────────────────
+replicate>=1.0.0
+
+# ── Google Maps / HTTP ────────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Image processing ──────────────────────────────────────────────────────────
+Pillow>=10.0.0
+
+# ── Data validation ───────────────────────────────────────────────────────────
+pydantic>=2.0.0
+
+# ── Map visualisation ─────────────────────────────────────────────────────────
+folium>=0.17.0
+streamlit-folium>=0.21.0
+
+# ── Live browser geolocation ──────────────────────────────────────────────────
+streamlit-js-eval>=1.0.0
+
+# ── Data display ─────────────────────────────────────────────────────────────
+pandas>=2.0.0
