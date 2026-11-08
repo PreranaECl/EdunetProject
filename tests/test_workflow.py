@@ -1,7 +1,7 @@
 """
 tests/test_workflow.py — Integration-level tests for the two-agent workflow.
 
-All Replicate API and Google Maps calls are mocked so no real credentials are needed.
+All Groq API and Google Maps calls are mocked so no real credentials are needed.
 """
 
 import json
@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import replicate_client
+import groq_client as replicate_client   # alias for test compatibility
 import maps_service
 import agents
 from schemas import EmergencyAssessment, EmergencyResponse
@@ -67,12 +67,27 @@ def _fake_help_centers():
             "address": "123 Main Street, Bengaluru",
             "distance_km": 1.5,
             "phone": "+91 80 1234 5678",
-            "place_id": "PLACE_TEST_001",
-            "maps_url": "https://www.google.com/maps/place/?q=place_id:PLACE_TEST_001",
+            "place_id": "node/111111",
+            "maps_url": "https://www.openstreetmap.org/node/111111",
             "latitude": 12.9600,
             "longitude": 77.5800,
         }
     ]
+
+
+def _make_fake_groq_response(data: dict) -> MagicMock:
+    """Build a mock Groq chat.completions.create() response."""
+    msg = MagicMock()
+    msg.content = json.dumps(data)
+    choice = MagicMock()
+    choice.message = msg
+    usage = MagicMock()
+    usage.prompt_tokens = 100
+    usage.completion_tokens = 200
+    resp = MagicMock()
+    resp.choices = [choice]
+    resp.usage = usage
+    return resp
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -81,21 +96,22 @@ def _fake_help_centers():
 def configure_fake_apis():
     """Configure fake API clients before each test."""
     replicate_client.configure_replicate(
-        api_token="FAKE_REPLICATE_TOKEN",
-        assessment_model="meta/llama-3.2-11b-vision-instruct",
-        response_model="meta/llama-3.1-70b-instruct",
+        api_token="FAKE_GROQ_KEY",
+        assessment_model="llama-3.2-11b-vision-preview",
+        response_model="llama-3.3-70b-versatile",
     )
-    maps_service._maps_api_key = "FAKE_MAPS_KEY"
+    maps_service._enabled = True
     yield
-    maps_service._maps_api_key = None
 
 
 # ── Assessment Agent tests ────────────────────────────────────────────────────
 
 class TestAssessmentAgent:
-    @patch("replicate_client._run_replicate")
-    def test_successful_assessment(self, mock_run):
-        mock_run.return_value = json.dumps(_mock_assessment_dict())
+    @patch("groq_client._client")
+    def test_successful_assessment(self, mock_client):
+        mock_client.chat.completions.create.return_value = (
+            _make_fake_groq_response(_mock_assessment_dict())
+        )
 
         agent = agents.EmergencyAssessmentAgent()
         assessment, record = agent.run(
@@ -110,9 +126,12 @@ class TestAssessmentAgent:
         assert record.status == "Completed"
         assert record.validation == "Passed"
 
-    @patch("replicate_client._run_replicate")
-    def test_invalid_json_response_fails(self, mock_run):
-        mock_run.return_value = "This is not valid JSON at all."
+    @patch("groq_client._client")
+    def test_invalid_json_response_fails(self, mock_client):
+        msg = MagicMock(); msg.content = "This is not valid JSON at all."
+        choice = MagicMock(); choice.message = msg
+        bad = MagicMock(); bad.choices = [choice]; bad.usage = None
+        mock_client.chat.completions.create.return_value = bad
 
         agent = agents.EmergencyAssessmentAgent()
         assessment, record = agent.run(
@@ -124,10 +143,12 @@ class TestAssessmentAgent:
         assert assessment is None
         assert record.status == "Failed"
 
-    @patch("replicate_client._run_replicate")
-    def test_schema_validation_failure(self, mock_run):
+    @patch("groq_client._client")
+    def test_schema_validation_failure(self, mock_client):
         bad_data = {"agent": "Emergency Assessment Agent", "summary": "Bad schema"}
-        mock_run.return_value = json.dumps(bad_data)
+        mock_client.chat.completions.create.return_value = (
+            _make_fake_groq_response(bad_data)
+        )
 
         agent = agents.EmergencyAssessmentAgent()
         assessment, record = agent.run(
@@ -146,9 +167,11 @@ class TestResponseAgent:
     def _valid_assessment(self) -> EmergencyAssessment:
         return EmergencyAssessment(**_mock_assessment_dict())
 
-    @patch("replicate_client._run_replicate")
-    def test_successful_response(self, mock_run):
-        mock_run.return_value = json.dumps(_mock_response_dict())
+    @patch("groq_client._client")
+    def test_successful_response(self, mock_client):
+        mock_client.chat.completions.create.return_value = (
+            _make_fake_groq_response(_mock_response_dict())
+        )
 
         agent = agents.EmergencyResponseAgent()
         response, record = agent.run(
@@ -174,21 +197,22 @@ class TestResponseAgent:
         assert response is None
         assert record.status == "Blocked"
 
-    @patch("replicate_client._run_replicate")
-    def test_severity_mismatch_corrected(self, mock_run):
+    @patch("groq_client._client")
+    def test_severity_mismatch_corrected(self, mock_client):
         """If response severity differs from assessment, it should be corrected."""
         resp_data = _mock_response_dict()
         resp_data["severity_level"] = "Low"        # Mismatch: assessment is High
-        mock_run.return_value = json.dumps(resp_data)
+        mock_client.chat.completions.create.return_value = (
+            _make_fake_groq_response(resp_data)
+        )
 
         agent = agents.EmergencyResponseAgent()
         response, record = agent.run(
-            assessment=self._valid_assessment(),   # severity = High
+            assessment=self._valid_assessment(),
             help_centers=[],
             original_description="Collision.",
         )
 
-        # Corrected to assessment severity
         if response is not None:
             assert response.severity_level == "High"
 
@@ -196,48 +220,41 @@ class TestResponseAgent:
 # ── Full workflow tests ───────────────────────────────────────────────────────
 
 class TestFullWorkflow:
+    @patch("maps_service.requests.post")
     @patch("maps_service.requests.get")
-    @patch("replicate_client._run_replicate")
-    def test_full_workflow_success(self, mock_run, mock_maps_get):
-        # Mock Replicate: alternate between assessment and response
+    @patch("groq_client._client")
+    def test_full_workflow_success(self, mock_groq, mock_maps_get, mock_maps_post):
         call_count = {"n": 0}
 
-        def replicate_side_effect(model, input_payload):
+        def groq_side_effect(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return json.dumps(_mock_assessment_dict())
-            return json.dumps(_mock_response_dict())
+                return _make_fake_groq_response(_mock_assessment_dict())
+            return _make_fake_groq_response(_mock_response_dict())
 
-        mock_run.side_effect = replicate_side_effect
+        mock_groq.chat.completions.create.side_effect = groq_side_effect
 
-        # Mock Maps: geocoding + places nearby
-        def maps_side_effect(url, params=None, timeout=None):
+        def maps_get_side_effect(url, params=None, timeout=None, **kw):
             m = MagicMock()
-            if "geocode" in url:
-                m.json.return_value = {
-                    "status": "OK",
-                    "results": [{
-                        "formatted_address": "MG Road, Bengaluru",
-                        "geometry": {"location": {"lat": 12.9716, "lng": 77.5946}},
-                    }],
-                }
-            elif "nearbysearch" in url:
-                m.json.return_value = {
-                    "status": "OK",
-                    "results": [{
-                        "name": "City Hospital",
-                        "place_id": "TEST_PLACE",
-                        "vicinity": "Fort, Bengaluru",
-                        "geometry": {"location": {"lat": 12.96, "lng": 77.58}},
-                    }],
-                }
-            elif "details" in url:
-                m.json.return_value = {"result": {"formatted_phone_number": "+91 80 9876 5432"}}
-            else:
-                m.json.return_value = {}
+            m.json.return_value = [{
+                "lat": "12.9716", "lon": "77.5946",
+                "display_name": "MG Road, Bengaluru",
+            }]
             return m
 
-        mock_maps_get.side_effect = maps_side_effect
+        mock_maps_get.side_effect = maps_get_side_effect
+
+        def maps_post_side_effect(url, data=None, timeout=None, headers=None, **kw):
+            m = MagicMock()
+            m.raise_for_status = MagicMock()
+            m.json.return_value = {"elements": [{
+                "type": "node", "id": 1,
+                "lat": 12.96, "lon": 77.58,
+                "tags": {"name": "City Hospital", "amenity": "hospital"},
+            }]}
+            return m
+
+        mock_maps_post.side_effect = maps_post_side_effect
 
         result = agents.run_emergency_workflow(
             emergency_type="Road Accident",
@@ -250,10 +267,14 @@ class TestFullWorkflow:
         assert result["response"] is not None
         assert len(result["execution_log"]) >= 2
 
+    @patch("maps_service.requests.post")
     @patch("maps_service.requests.get")
-    @patch("replicate_client._run_replicate")
-    def test_workflow_fails_on_assessment_error(self, mock_run, mock_maps_get):
-        mock_run.return_value = "Not JSON at all"
+    @patch("groq_client._client")
+    def test_workflow_fails_on_assessment_error(self, mock_groq, mock_maps_get, mock_maps_post):
+        msg = MagicMock(); msg.content = "Not JSON"
+        choice = MagicMock(); choice.message = msg
+        bad = MagicMock(); bad.choices = [choice]; bad.usage = None
+        mock_groq.chat.completions.create.return_value = bad
 
         result = agents.run_emergency_workflow(
             emergency_type="Medical Emergency",
@@ -265,31 +286,35 @@ class TestFullWorkflow:
         assert result["assessment"] is None
         assert "error_message" in result
 
+    @patch("maps_service.requests.post")
     @patch("maps_service.requests.get")
-    @patch("replicate_client._run_replicate")
-    def test_workflow_returns_partial_on_response_failure(self, mock_run, mock_maps_get):
+    @patch("groq_client._client")
+    def test_workflow_returns_partial_on_response_failure(self, mock_groq, mock_maps_get, mock_maps_post):
         call_count = {"n": 0}
 
-        def replicate_side_effect(model, input_payload):
+        def groq_side_effect(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return json.dumps(_mock_assessment_dict())
-            return "invalid json for response"
+                return _make_fake_groq_response(_mock_assessment_dict())
+            msg = MagicMock(); msg.content = "invalid json"
+            choice = MagicMock(); choice.message = msg
+            bad = MagicMock(); bad.choices = [choice]; bad.usage = None
+            return bad
 
-        mock_run.side_effect = replicate_side_effect
+        mock_groq.chat.completions.create.side_effect = groq_side_effect
 
-        def maps_side_effect(url, params=None, timeout=None):
+        def maps_get_side_effect(url, **kw):
             m = MagicMock()
-            if "geocode" in url:
-                m.json.return_value = {
-                    "status": "OK",
-                    "results": [{"formatted_address": "Bengaluru", "geometry": {"location": {"lat": 12.97, "lng": 77.59}}}],
-                }
-            else:
-                m.json.return_value = {"status": "ZERO_RESULTS", "results": []}
+            m.json.return_value = [{"lat": "12.97", "lon": "77.59", "display_name": "Bengaluru"}]
             return m
 
-        mock_maps_get.side_effect = maps_side_effect
+        def maps_post_side_effect(url, **kw):
+            m = MagicMock(); m.raise_for_status = MagicMock()
+            m.json.return_value = {"elements": []}
+            return m
+
+        mock_maps_get.side_effect = maps_get_side_effect
+        mock_maps_post.side_effect = maps_post_side_effect
 
         result = agents.run_emergency_workflow(
             emergency_type="Medical Emergency",
@@ -297,7 +322,6 @@ class TestFullWorkflow:
             location="Bengaluru",
         )
 
-        # Assessment succeeded, response failed — partial result
         assert result["assessment"] is not None
         assert result["response"] is None
         assert result["status"] == "failed"

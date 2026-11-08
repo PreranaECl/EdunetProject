@@ -31,23 +31,25 @@ from schemas import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Replicate per-model cost table
+# Groq per-model cost table
 # Prices in USD per million tokens (input / output)
-# Source: https://replicate.com/pricing (approximate as of 2025)
+# Source: https://groq.com/pricing (as of 2025)
+# Groq free tier: $0 up to daily limits — costs apply on paid tier
 # ---------------------------------------------------------------------------
 
-REPLICATE_PRICING: dict[str, dict] = {
+REPLICATE_PRICING: dict[str, dict] = {   # name kept for backwards-compat
     # model_id_fragment → {input_per_mtok, output_per_mtok}
-    "llama-3.2-11b":       {"input": 0.06,  "output": 0.06},
-    "llama-3.2-90b":       {"input": 0.90,  "output": 0.90},
-    "llama-3.1-8b":        {"input": 0.05,  "output": 0.25},
-    "llama-3.1-70b":       {"input": 0.65,  "output": 2.75},
-    "llama-3.1-405b":      {"input": 9.50,  "output": 9.50},
-    "llama-3-8b":          {"input": 0.05,  "output": 0.25},
-    "llama-3-70b":         {"input": 0.65,  "output": 2.75},
-    "mistral-7b":          {"input": 0.05,  "output": 0.25},
-    "mixtral-8x7b":        {"input": 0.30,  "output": 1.00},
-    "default":             {"input": 0.10,  "output": 0.30},
+    "llama-4-scout":       {"input": 0.11,  "output": 0.34},
+    "llama-4-maverick":    {"input": 0.50,  "output": 0.77},
+    "llama-3.3-70b":       {"input": 0.59,  "output": 0.79},
+    "llama-3.1-70b":       {"input": 0.59,  "output": 0.79},
+    "llama-3.1-8b":        {"input": 0.05,  "output": 0.08},
+    "llama-3-70b":         {"input": 0.59,  "output": 0.79},
+    "llama-3-8b":          {"input": 0.05,  "output": 0.08},
+    "mixtral-8x7b":        {"input": 0.24,  "output": 0.24},
+    "gemma2-9b":           {"input": 0.20,  "output": 0.20},
+    "gemma-7b":            {"input": 0.07,  "output": 0.07},
+    "default":             {"input": 0.11,  "output": 0.34},
 }
 
 
@@ -398,8 +400,12 @@ def update_metrics_from_workflow(
             metrics.maps_api_calls += maps_result.get("api_calls", 0)
             point.maps_s = round(t, 3)
 
-    # Cost estimation (Fix 2)
-    from replicate_client import _assessment_model, _response_model
+    # Cost estimation — safe import in case groq_client not yet configured
+    try:
+        from groq_client import _assessment_model, _response_model
+    except Exception:
+        _assessment_model = "llama-3.3-70b-versatile"
+        _response_model = "llama-3.3-70b-versatile"
     workflow_cost = (
         estimate_cost_usd(_assessment_model, point.input_tokens // 2, point.output_tokens // 2)
         + estimate_cost_usd(_response_model, point.input_tokens // 2, point.output_tokens // 2)

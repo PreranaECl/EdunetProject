@@ -38,7 +38,7 @@ st.set_page_config(
 
 # ── Project imports (after page config) ──────────────────────────────────────
 import agents
-import replicate_client
+import groq_client as replicate_client  # drop-in replacement
 import guardrails
 import maps_service
 import memory
@@ -118,34 +118,39 @@ def render_sidebar() -> dict:
     with st.sidebar:
         st.markdown("## 🔧 Configuration")
 
-        # ── Replicate ─────────────────────────────────────────────────────────
-        st.markdown("### 🤖 Replicate API")
+        # ── Groq AI ───────────────────────────────────────────────────────────
+        st.markdown("### 🤖 Groq AI (Free)")
+        st.caption("Get a free API key at https://console.groq.com — no payment needed.")
 
         # Load from Streamlit secrets or environment variables as defaults
         try:
-            default_replicate_token = st.secrets.get("REPLICATE_API_TOKEN", "")
+            default_replicate_token = st.secrets.get("GROQ_API_KEY", "")
         except Exception:
             default_replicate_token = ""
-        default_replicate_token = default_replicate_token or os.environ.get("REPLICATE_API_TOKEN", "")
+        default_replicate_token = (
+            default_replicate_token
+            or os.environ.get("GROQ_API_KEY", "")
+            or os.environ.get("REPLICATE_API_TOKEN", "")
+        )
 
         replicate_token = st.text_input(
-            "Replicate API Token",
+            "Groq API Key",
             value=default_replicate_token,
             type="password",
-            help="Your Replicate API token (r8_...). Never shared or logged.",
-            placeholder="r8_...",
+            help="Your Groq API key (gsk_...). Free — no payment required. Never shared or logged.",
+            placeholder="gsk_...",
         )
 
         assessment_model = st.text_input(
             "Assessment Model",
-            value="meta/llama-3.2-11b-vision-instruct",
-            help="Replicate model for Emergency Assessment Agent (supports images).",
+            value="llama-3.2-11b-vision-preview",
+            help="Groq model for Emergency Assessment Agent. llama-3.2-11b-vision-preview supports images.",
         )
 
         response_model = st.text_input(
             "Response Model",
-            value="meta/llama-3.1-70b-instruct",
-            help="Replicate model for Emergency Response Agent.",
+            value="llama-3.3-70b-versatile",
+            help="Groq model for Emergency Response Agent.",
         )
 
         # ── Map Service (free — no key needed) ───────────────────────────────
@@ -163,7 +168,7 @@ def render_sidebar() -> dict:
 
         col1, col2 = st.columns(2)
 
-        # Replicate connection
+        # Groq connection
         with col1:
             if replicate_token:
                 try:
@@ -173,13 +178,13 @@ def render_sidebar() -> dict:
                         response_model=response_model,
                     )
                     st.session_state["replicate_configured"] = True
-                    st.success("✅ Replicate")
+                    st.success("✅ Groq AI")
                 except Exception as exc:
                     st.session_state["replicate_configured"] = False
-                    st.error(f"❌ Replicate\n{exc}")
+                    st.error(f"❌ Groq AI\n{exc}")
             else:
                 st.session_state["replicate_configured"] = False
-                st.warning("⚠️ Replicate\nNot configured")
+                st.warning("⚠️ Groq AI\nNot configured")
 
         # Free map service status
         with col2:
@@ -1084,8 +1089,9 @@ def _render_assistance_tab(config: dict) -> None:
     # ── Configuration check ───────────────────────────────────────────────────
     if not st.session_state.get("replicate_configured"):
         st.error(
-            "❌ Replicate API is not configured. "
-            "Please enter a valid Replicate API token in the sidebar before continuing.\n\n"
+            "❌ Groq API is not configured. "
+            "Please enter a free Groq API key (gsk_...) in the sidebar.  \n"
+            "Get one free at https://console.groq.com — no payment needed.\n\n"
             "🚨 While configuring, remember: **call 112 for immediate danger**."
         )
         return
