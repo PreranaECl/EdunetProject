@@ -4,8 +4,8 @@
 # ── Core UI ──────────────────────────────────────────────────────────────────
 streamlit>=1.35.0
 
-# ── Groq AI API (free tier — no payment method needed) ───────────────────────
-groq>=0.9.0
+# ── Google Gemini API (free tier / Google AI Studio) ─────────────────────────
+google-genai>=1.0.0
 
 # ── Google Maps / HTTP ────────────────────────────────────────────────────────
 requests>=2.31.0
@@ -23,5 +23,11 @@ streamlit-folium>=0.21.0
 # ── Live browser geolocation ──────────────────────────────────────────────────
 streamlit-js-eval>=1.0.0
 
+# ── Environment variable loading (.env file) ──────────────────────────────────
+python-dotenv>=1.0.0
+
 # ── Data display ─────────────────────────────────────────────────────────────
 pandas>=2.0.0
+
+# ── IBM watsonx.ai (Project Overview Agent) ──────────────────────────────────
+ibm-watsonx-ai>=1.0.0

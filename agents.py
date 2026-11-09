@@ -16,7 +16,7 @@ import logging
 import time
 from typing import Optional, Tuple
 
-import groq_client as replicate_client  # drop-in replacement
+import gemini_client as replicate_client
 import guardrails
 import maps_service
 from schemas import (

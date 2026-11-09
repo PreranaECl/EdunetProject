@@ -19,6 +19,13 @@ import logging
 import os
 from typing import Optional
 
+# ── Load .env file first so all os.environ.get() calls pick up real values ────
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except ImportError:
+    pass   # dotenv optional — env vars can still be set externally
+
 import streamlit as st
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -38,11 +45,13 @@ st.set_page_config(
 
 # ── Project imports (after page config) ──────────────────────────────────────
 import agents
-import groq_client as replicate_client  # drop-in replacement
+import gemini_client as replicate_client
 import guardrails
 import maps_service
 import memory
+import overview_agent as _overview_module
 import utils
+import watsonx_client
 from streamlit_js_eval import streamlit_js_eval
 from utils import (
     average_response_time,
@@ -100,6 +109,15 @@ def _init_session_state() -> None:
         "live_lon": "",
         "live_address": "",
         "token_budget": 0,
+        # Project overview panel
+        "show_overview": False,
+        "overview_text": "",
+        "overview_question": "",
+        "watsonx_configured": False,
+        # Live location fetch state
+        "_geo_fetch": False,
+        "_geo_error": "",
+        "live_accuracy": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -113,44 +131,109 @@ _init_session_state()
 #  SIDEBAR
 # =============================================================================
 
+# =============================================================================
+#  PROJECT OVERVIEW PANEL
+# =============================================================================
+
+def render_overview_panel() -> None:
+    """Render the full-width project overview panel below the main header."""
+    agent = _overview_module.ProjectOverviewAgent()
+
+    st.markdown("---")
+    col_title, col_close = st.columns([6, 1])
+    with col_title:
+        st.markdown("## 📋 Project Overview")
+        st.caption("Powered by **IBM watsonx.ai — Granite 3 8B Instruct**")
+    with col_close:
+        st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
+        if st.button("✕ Close", key="btn_close_overview", use_container_width=True):
+            st.session_state["show_overview"] = False
+            st.rerun()
+
+    # Question input
+    col_q, col_ask = st.columns([4, 1])
+    with col_q:
+        question = st.text_input(
+            "Ask a specific question or leave blank for the full overview",
+            value=st.session_state.get("overview_question", ""),
+            placeholder="e.g. How does the agent pipeline work?",
+            key="overview_question_input",
+            label_visibility="collapsed",
+        )
+    with col_ask:
+        ask_btn = st.button("🔍 Ask", use_container_width=True, key="btn_ask_overview")
+
+    if ask_btn or not st.session_state.get("overview_text"):
+        with st.spinner("🔍 Searching project knowledge base..."):
+            text, latency, used_watsonx = agent.generate_overview(question)
+            st.session_state["overview_text"] = text
+            st.session_state["overview_question"] = question
+            if used_watsonx:
+                st.caption(f"✅ Answered by IBM watsonx.ai (Granite) in {latency:.2f}s")
+            else:
+                st.caption(f"✅ Answered from project knowledge base in {latency:.3f}s")
+
+    # Display the overview
+    overview_text = st.session_state.get("overview_text", "")
+    if overview_text:
+        st.markdown(overview_text)
+
+    st.markdown("---")
+
+
+# =============================================================================
+#  SIDEBAR
+# =============================================================================
+
 def render_sidebar() -> dict:
     """Render the configuration sidebar and return active settings."""
     with st.sidebar:
         st.markdown("## 🔧 Configuration")
 
-        # ── Groq AI ───────────────────────────────────────────────────────────
-        st.markdown("### 🤖 Groq AI (Free)")
-        st.caption("Get a free API key at https://console.groq.com — no payment needed.")
+        # ── Gemini AI (free tier) ─────────────────────────────────────────────
+        st.markdown("### 🤖 Gemini AI (Free)")
 
         # Load from Streamlit secrets or environment variables as defaults
+        # Never pre-fill known placeholder values
         try:
-            default_replicate_token = st.secrets.get("GROQ_API_KEY", "")
+            _env_key = st.secrets.get("GEMINI_API_KEY", "")
         except Exception:
-            default_replicate_token = ""
-        default_replicate_token = (
-            default_replicate_token
-            or os.environ.get("GROQ_API_KEY", "")
-            or os.environ.get("REPLICATE_API_TOKEN", "")
+            _env_key = ""
+        _env_key = (
+            _env_key
+            or os.environ.get("GEMINI_API_KEY", "")
+            or os.environ.get("GOOGLE_API_KEY", "")
         )
+        _PLACEHOLDERS = {"your-gemini-api-key-here", "your-google-api-key-here"}
+        if _env_key.strip() in _PLACEHOLDERS:
+            _env_key = ""
 
         replicate_token = st.text_input(
-            "Groq API Key",
-            value=default_replicate_token,
+            "Gemini API Key",
+            value=_env_key,
             type="password",
-            help="Your Groq API key (gsk_...). Free — no payment required. Never shared or logged.",
-            placeholder="gsk_...",
+            help="Paste your Gemini API key here. Get a free key (no card needed) at https://aistudio.google.com/app/apikey",
+            placeholder="AIza...  (paste your free key here)",
         )
+
+        if not replicate_token:
+            st.warning(
+                "⚠️ **Gemini API key required**  \n"
+                "Get a free key (no payment) at  \n"
+                "👉 https://aistudio.google.com/app/apikey  \n"
+                "Then paste it in the box above."
+            )
 
         assessment_model = st.text_input(
             "Assessment Model",
-            value="llama-3.2-11b-vision-preview",
-            help="Groq model for Emergency Assessment Agent. llama-3.2-11b-vision-preview supports images.",
+            value=os.environ.get("GEMINI_ASSESSMENT_MODEL", "gemini-3.5-flash-lite"),
+            help="Gemini model for the assessment agent.",
         )
 
         response_model = st.text_input(
             "Response Model",
-            value="llama-3.3-70b-versatile",
-            help="Groq model for Emergency Response Agent.",
+            value=os.environ.get("GEMINI_RESPONSE_MODEL", "gemini-3.5-flash-lite"),
+            help="Gemini model for the response agent.",
         )
 
         # ── Map Service (free — no key needed) ───────────────────────────────
@@ -168,23 +251,23 @@ def render_sidebar() -> dict:
 
         col1, col2 = st.columns(2)
 
-        # Groq connection
+        # Gemini connection
         with col1:
             if replicate_token:
                 try:
-                    replicate_client.configure_replicate(
-                        api_token=replicate_token,
+                    replicate_client.configure_gemini(
+                        api_key=replicate_token,
                         assessment_model=assessment_model,
                         response_model=response_model,
                     )
                     st.session_state["replicate_configured"] = True
-                    st.success("✅ Groq AI")
+                    st.success("✅ Gemini AI")
                 except Exception as exc:
                     st.session_state["replicate_configured"] = False
-                    st.error(f"❌ Groq AI\n{exc}")
+                    st.error(f"❌ Gemini AI\n{exc}")
             else:
                 st.session_state["replicate_configured"] = False
-                st.warning("⚠️ Groq AI\nNot configured")
+                st.warning("⚠️ Gemini AI\nNot configured")
 
         # Free map service status
         with col2:
@@ -273,31 +356,21 @@ def render_emergency_banner() -> None:
 def _request_live_location() -> None:
     """
     Render the live location capture widget (outside the form).
-    Uses streamlit-js-eval to call navigator.geolocation in the browser.
-    Writes lat/lon + address into st.session_state on success.
-    """
-    # ── Live location button ──────────────────────────────────────────────────
-    loc_col1, loc_col2 = st.columns([2, 1])
-    with loc_col1:
-        st.markdown(
-            "📍 **Live Location** — click the button to auto-detect your current location "
-            "using your device's GPS/network. Browser permission is required."
-        )
-    with loc_col2:
-        get_loc = st.button(
-            "📍 Use My Live Location",
-            key="btn_live_loc",
-            use_container_width=True,
-            help="Requests your browser's location. Your device must allow location access.",
-        )
 
-    if get_loc:
-        # Ask the browser for geolocation via JS
+    Flow:
+      1. User clicks button  -> sets session_state["_geo_fetch"] = True -> rerun
+      2. On rerun, JS fires unconditionally  -> returns coords -> saves to session state
+         -> clears trigger -> st.rerun() so form re-renders with pre-filled values
+    """
+    from guardrails import validate_coordinates
+
+    # ── Step 2: JS fires when trigger is set ─────────────────────────────────
+    if st.session_state.get("_geo_fetch"):
         geo_result = streamlit_js_eval(
             js_expressions="""
-                new Promise((resolve, reject) => {
+                new Promise((resolve) => {
                     if (!navigator.geolocation) {
-                        resolve({error: "Geolocation is not supported by this browser."});
+                        resolve({error: "Geolocation not supported by this browser."});
                         return;
                     }
                     navigator.geolocation.getCurrentPosition(
@@ -307,54 +380,201 @@ def _request_live_location() -> None:
                             accuracy: pos.coords.accuracy
                         }),
                         (err) => resolve({error: err.message}),
-                        {enableHighAccuracy: true, timeout: 10000, maximumAge: 0}
+                        {enableHighAccuracy: true, timeout: 12000, maximumAge: 0}
                     );
                 })
             """,
-            key="geo_js",
+            key="geo_js_v2",
         )
-
-        if geo_result:
+        if geo_result is not None:
+            # Clear the trigger so JS doesn't fire again on the next rerun
+            st.session_state["_geo_fetch"] = False
             if "error" in geo_result:
-                st.error(
-                    f"❌ Location access failed: {geo_result['error']}  \n"
-                    "Please allow location permission in your browser, or enter your location manually below."
-                )
+                st.session_state["_geo_error"] = geo_result["error"]
             else:
                 lat = geo_result.get("lat")
                 lon = geo_result.get("lon")
                 accuracy = geo_result.get("accuracy", 0)
                 if lat is not None and lon is not None:
-                    # Validate coordinate ranges
-                    from guardrails import validate_coordinates
                     coord_check = validate_coordinates(lat, lon)
                     if coord_check.passed:
-                        # Reverse-geocode to get a readable address
                         address = maps_service.reverse_geocode(lat, lon)
-                        st.session_state["live_lat"] = str(round(lat, 6))
-                        st.session_state["live_lon"] = str(round(lon, 6))
+                        st.session_state["live_lat"]     = str(round(lat, 6))
+                        st.session_state["live_lon"]     = str(round(lon, 6))
                         st.session_state["live_address"] = address
-                        acc_str = f"{accuracy:.0f} m" if accuracy else "unknown"
-                        st.success(
-                            f"✅ **Live location captured!** ({round(lat,5)}, {round(lon,5)})  \n"
-                            f"📍 {address}  \n"
-                            f"Accuracy: ~{acc_str}"
-                        )
+                        st.session_state["live_accuracy"] = accuracy
+                        st.session_state.pop("_geo_error", None)
+                        # Rerun so the form re-renders with pre-filled values
+                        st.rerun()
                     else:
-                        st.error(f"Invalid coordinates received: {coord_check.message}")
+                        st.session_state["_geo_error"] = coord_check.message
 
-    # Show current live location status
-    if st.session_state.get("live_lat") and st.session_state.get("live_lon"):
-        st.info(
-            f"🟢 Live location active: **{st.session_state.get('live_address', '')}**  \n"
-            f"Coordinates: {st.session_state['live_lat']}, {st.session_state['live_lon']}  \n"
-            "_These will be used automatically in the form below._"
+    # ── Show any geolocation error ────────────────────────────────────────────
+    if st.session_state.get("_geo_error"):
+        st.error(
+            f"❌ Location access failed: {st.session_state['_geo_error']}  \n"
+            "Allow location permission in your browser, or enter your location manually."
         )
-        if st.button("🗑️ Clear live location", key="btn_clear_loc"):
-            st.session_state.pop("live_lat", None)
-            st.session_state.pop("live_lon", None)
-            st.session_state.pop("live_address", None)
+
+    # ── Step 1: Button sets the trigger ──────────────────────────────────────
+    loc_col1, loc_col2 = st.columns([3, 1])
+    with loc_col1:
+        if st.session_state.get("live_lat"):
+            st.markdown(
+                "✅ **Live location captured** — coordinates and address are auto-filled below."
+            )
+        else:
+            st.markdown(
+                "📍 **Live Location** — click **Use My Location** to auto-detect your GPS position. "
+                "Browser location permission is required."
+            )
+    with loc_col2:
+        if st.button(
+            "📍 Use My Location",
+            key="btn_live_loc",
+            use_container_width=True,
+            type="primary",
+            help="Detects your GPS position via the browser. Allow location access when prompted.",
+        ):
+            st.session_state["_geo_fetch"] = True
+            st.session_state.pop("_geo_error", None)
             st.rerun()
+
+    # ── Fetching spinner ─────────────────────────────────────────────────────
+    if st.session_state.get("_geo_fetch"):
+        st.info("⏳ Waiting for browser GPS... please allow location access when prompted.")
+
+    # Show current live location status + live map
+    if st.session_state.get("live_lat") and st.session_state.get("live_lon"):
+        live_lat  = float(st.session_state["live_lat"])
+        live_lon  = float(st.session_state["live_lon"])
+        live_addr = st.session_state.get("live_address", "")
+        accuracy  = st.session_state.get("live_accuracy", 0)
+        acc_str   = f"~{accuracy:.0f} m" if accuracy else "unknown"
+
+        info_col, clear_col = st.columns([5, 1])
+        with info_col:
+            st.success(
+                f"✅ **Live location captured!**  \n"
+                f"📍 {live_addr}  \n"
+                f"🌐 Coordinates: `{live_lat}, {live_lon}`  &nbsp;|&nbsp;  "
+                f"Accuracy: `{acc_str}`  \n"
+                "_Location and coordinates are auto-filled in the form below._"
+            )
+        with clear_col:
+            st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
+            if st.button("🗑️ Clear", key="btn_clear_loc", use_container_width=True):
+                for k in ("live_lat", "live_lon", "live_address", "live_accuracy", "_geo_error"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+        # ── Live location mini-map ────────────────────────────────────────────
+        try:
+            import folium
+            from folium import plugins as folium_plugins
+            from streamlit_folium import st_folium
+
+            lm_tab1, lm_tab2 = st.tabs(["🗺️ Live Location Map", "🌐 Street View"])
+
+            with lm_tab1:
+                lm = folium.Map(
+                    location=[live_lat, live_lon],
+                    zoom_start=16,
+                    tiles=None,
+                )
+                # Street Map — OSM (free, no key)
+                folium.TileLayer(
+                    tiles="OpenStreetMap",
+                    name="Street Map",
+                ).add_to(lm)
+                # Satellite — Esri public tile (free, no key)
+                folium.TileLayer(
+                    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                    attr="Esri World Imagery",
+                    name="Satellite",
+                ).add_to(lm)
+                # Terrain — Esri public tile (free, no key)
+                folium.TileLayer(
+                    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+                    attr="Esri World Topo",
+                    name="Terrain",
+                ).add_to(lm)
+
+                # Pulsing user marker
+                folium.Marker(
+                    location=[live_lat, live_lon],
+                    popup=folium.Popup(
+                        f"<b>📍 Your Live Location</b><br>{live_addr}",
+                        max_width=250,
+                    ),
+                    tooltip="📍 You are here",
+                    icon=folium.Icon(color="red", icon="star", prefix="fa"),
+                ).add_to(lm)
+
+                # Accuracy ring (approximate 50m visual)
+                folium.Circle(
+                    location=[live_lat, live_lon],
+                    radius=80,
+                    color="#dc2626",
+                    weight=2,
+                    fill=True,
+                    fill_opacity=0.12,
+                    tooltip="~Accuracy area",
+                ).add_to(lm)
+
+                # LocateControl — lets user re-centre with browser GPS
+                try:
+                    folium_plugins.LocateControl(
+                        auto_start=False,
+                        position="topright",
+                        strings={"title": "Re-centre on my location"},
+                    ).add_to(lm)
+                except Exception:
+                    pass
+
+                try:
+                    folium_plugins.Fullscreen(position="topright").add_to(lm)
+                except Exception:
+                    pass
+
+                folium.LayerControl(position="topright", collapsed=True).add_to(lm)
+                st_folium(lm, width="100%", height=380, returned_objects=[])
+                st.caption(
+                    f"📍 Live map — centred on ({live_lat:.5f}, {live_lon:.5f})  |  "
+                    "OpenStreetMap · free, no API key"
+                )
+
+            with lm_tab2:
+                osm_url = (
+                    f"https://www.openstreetmap.org/export/embed.html"
+                    f"?bbox={live_lon-0.03},{live_lat-0.03},{live_lon+0.03},{live_lat+0.03}"
+                    f"&layer=mapnik&marker={live_lat},{live_lon}"
+                )
+                full_osm = (
+                    f"https://www.openstreetmap.org/?mlat={live_lat}&mlon={live_lon}"
+                    f"&zoom=16#map=16/{live_lat}/{live_lon}"
+                )
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid #e5e7eb; border-radius:8px; overflow:hidden;">
+                      <iframe src="{osm_url}" width="100%" height="370"
+                        style="border:0; display:block;" allowfullscreen loading="lazy">
+                      </iframe>
+                    </div>
+                    <p style="margin-top:6px; font-size:12px; color:#57606a;">
+                      Live OpenStreetMap — free, no API key. &nbsp;
+                      <a href="{full_osm}" target="_blank" style="color:#3b82d4;">
+                        Open in full OpenStreetMap ↗
+                      </a>
+                    </p>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        except ImportError:
+            st.info("Install `folium` and `streamlit-folium` to see the live map.")
+        except Exception as exc:
+            st.warning(f"Live map could not render: {exc}")
 
 
 def render_input_form() -> Optional[dict]:
@@ -630,7 +850,7 @@ def render_map(help_centers: list, user_lat: float, user_lon: float) -> None:
         from folium import plugins as folium_plugins
         from streamlit_folium import st_folium
 
-        map_tab, gmaps_tab = st.tabs(["🗺️ Interactive Map", "🌐 Live Google Maps"])
+        map_tab, gmaps_tab = st.tabs(["🗺️ Interactive Map", "🌐 Live Street View"])
 
         with map_tab:
             # ── Base map ──────────────────────────────────────────────────────
@@ -661,9 +881,11 @@ def render_map(help_centers: list, user_lat: float, user_lon: float) -> None:
                 control=True,
             ).add_to(m)
 
+            # OSM HOT humanitarian tiles (free, no key) — good contrast
             folium.TileLayer(
-                tiles="CartoDB dark_matter",
-                name="Dark Mode",
+                tiles="https://tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
+                attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank">HOT</a>',
+                name="Humanitarian",
                 control=True,
             ).add_to(m)
 
@@ -754,6 +976,16 @@ def render_map(help_centers: list, user_lat: float, user_lon: float) -> None:
 
             for grp in category_groups.values():
                 grp.add_to(m)
+
+            # ── LocateControl — GPS re-centre button on the map ───────────────
+            try:
+                folium_plugins.LocateControl(
+                    auto_start=False,
+                    position="topright",
+                    strings={"title": "Centre map on my location"},
+                ).add_to(m)
+            except Exception:
+                pass
 
             # ── Fullscreen plugin ─────────────────────────────────────────────
             try:
@@ -1039,19 +1271,37 @@ def render_performance_dashboard(metrics: SessionMetrics) -> None:
 # =============================================================================
 
 def main() -> None:
-    # Header
-    st.markdown("# 🚨 EMERGENCY ASSIST AI")
-    st.markdown("### *AI-Powered Public Emergency Assistance and Nearest Help Center Finder*")
-    st.caption(
-        "Get emergency safety guidance and discover nearby hospitals, police stations, "
-        "fire stations, ambulance services, and disaster relief centers."
-    )
+    # ── Header row with inline "Project Overview" button ─────────────────────
+    hdr_col, btn_col = st.columns([5, 1])
+    with hdr_col:
+        st.markdown("# 🚨 EMERGENCY ASSIST AI")
+        st.markdown("### *AI-Powered Public Emergency Assistance and Nearest Help Center Finder*")
+        st.caption(
+            "Get emergency safety guidance and discover nearby hospitals, police stations, "
+            "fire stations, ambulance services, and disaster relief centers."
+        )
+    with btn_col:
+        st.markdown("<div style='margin-top:18px'></div>", unsafe_allow_html=True)
+        if st.button(
+            "📋 Project\nOverview",
+            key="btn_overview_main",
+            use_container_width=True,
+            type="primary",
+            help="View an AI-generated overview of this project powered by IBM watsonx.ai",
+        ):
+            st.session_state["show_overview"] = not st.session_state.get("show_overview", False)
+            st.session_state["overview_text"] = ""
+            st.rerun()
 
     # Always-visible emergency banner
     render_emergency_banner()
 
-    # Sidebar configuration
+    # Sidebar configuration (also renders the overview button)
     config = render_sidebar()
+
+    # ── Project Overview panel (toggled by main-page or sidebar button) ──────
+    if st.session_state.get("show_overview"):
+        render_overview_panel()
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
     tab_assist, tab_dashboard = st.tabs(["🆘 Emergency Assistance", "📊 Agent Performance"])
@@ -1089,10 +1339,13 @@ def _render_assistance_tab(config: dict) -> None:
     # ── Configuration check ───────────────────────────────────────────────────
     if not st.session_state.get("replicate_configured"):
         st.error(
-            "❌ Groq API is not configured. "
-            "Please enter a free Groq API key (gsk_...) in the sidebar.  \n"
-            "Get one free at https://console.groq.com — no payment needed.\n\n"
-            "🚨 While configuring, remember: **call 112 for immediate danger**."
+            "❌ **Gemini API key not configured.**  \n\n"
+            "To use Emergency Assist AI you need a **free** Google Gemini API key:  \n"
+            "1. Go to 👉 **https://aistudio.google.com/app/apikey**  \n"
+            "2. Sign in with your Google account (no payment needed)  \n"
+            "3. Click **Create API key** → copy the key (starts with `AIza`)  \n"
+            "4. Paste it into the **Gemini API Key** field in the left sidebar  \n\n"
+            "🚨 **If this is an immediate emergency, call 112 now — do not wait.**"
         )
         return
 

@@ -23,26 +23,45 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _client: Optional[genai.Client] = None
-_assessment_model: str = "gemini-2.5-flash"
-_response_model: str = "gemini-2.5-flash"
+_assessment_model: str = "gemini-3.5-flash-lite"
+_response_model: str = "gemini-3.5-flash-lite"
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Known placeholder values that must not be treated as real keys
+_PLACEHOLDER_KEYS = {
+    "your-gemini-api-key-here",
+    "your-google-api-key-here",
+    "AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    "",
+}
+
+
 def configure_gemini(
     api_key: str,
-    assessment_model: str = "gemini-2.5-flash",
-    response_model: str = "gemini-2.5-flash",
+    assessment_model: str = "gemini-3.5-flash-lite",
+    response_model: str = "gemini-3.5-flash-lite",
 ) -> None:
     """Initialise the Gemini client with the supplied API key and model IDs."""
     global _client, _assessment_model, _response_model
-    if not api_key or not api_key.strip():
-        raise ValueError("Gemini API key must not be empty.")
-    _client = genai.Client(api_key=api_key.strip())
-    _assessment_model = assessment_model.strip() or "gemini-2.5-flash"
-    _response_model = response_model.strip() or "gemini-2.5-flash"
+    key = (api_key or "").strip()
+    if not key or key in _PLACEHOLDER_KEYS:
+        raise ValueError(
+            "Gemini API key is missing or is still the placeholder value. "
+            "Get a free key at https://aistudio.google.com/app/apikey and paste it in the sidebar."
+        )
+    # Accept any key with length >= 20 (Google AI Studio keys vary in format)
+    if len(key) < 20:
+        raise ValueError(
+            f"This does not look like a valid Gemini API key (too short: {len(key)} chars). "
+            "Get yours free at https://aistudio.google.com/app/apikey"
+        )
+    _client = genai.Client(api_key=key)
+    _assessment_model = assessment_model.strip() or "gemini-3.5-flash-lite"
+    _response_model = response_model.strip() or "gemini-3.5-flash-lite"
     logger.info("Gemini client configured. Assessment model: %s | Response model: %s",
                 _assessment_model, _response_model)
 
@@ -198,14 +217,21 @@ def analyze_emergency(
     if image_bytes:
         user_content += "An emergency image has been provided. Analyze it alongside the description.\n"
 
-    full_prompt = ASSESSMENT_SYSTEM_PROMPT + "\n\nUser Input:\n" + user_content
-
-    parts = _build_content_parts(full_prompt, image_bytes, image_mime)
-    contents = [genai_types.Content(role="user", parts=parts)]
+    # google-genai v3: system prompt goes in config.system_instruction
+    # contents must be a plain string (text-only) or list[Part] (multimodal)
+    # Never wrap in Content(role="user", parts=[...]) — that causes 400 errors in v3
+    if image_bytes:
+        contents = [
+            genai_types.Part.from_text(text=user_content),
+            genai_types.Part.from_bytes(data=image_bytes, mime_type=image_mime),
+        ]
+    else:
+        contents = user_content   # plain string — simplest valid form for v3
 
     config = genai_types.GenerateContentConfig(
+        system_instruction=ASSESSMENT_SYSTEM_PROMPT,
         max_output_tokens=max_output_tokens,
-        temperature=0.2,          # Low temperature for consistent structured output
+        temperature=0.2,
     )
 
     start = time.perf_counter()
@@ -253,15 +279,12 @@ def generate_emergency_guidance(
     user_content = (
         f"Emergency Assessment (validated):\n{assessment_json}\n\n"
         f"Original Emergency Description:\n{original_description}\n\n"
-        f"Nearby Help Centers (actual Google Maps results):\n{help_centers_summary}\n"
+        f"Nearby Help Centers:\n{help_centers_summary}\n"
     )
 
-    full_prompt = RESPONSE_SYSTEM_PROMPT + "\n\nInput:\n" + user_content
-
-    parts = [genai_types.Part.from_text(text=full_prompt)]
-    contents = [genai_types.Content(role="user", parts=parts)]
-
+    # google-genai v3: system_instruction in config, user content as plain string
     config = genai_types.GenerateContentConfig(
+        system_instruction=RESPONSE_SYSTEM_PROMPT,
         max_output_tokens=max_output_tokens,
         temperature=0.2,
     )
@@ -269,7 +292,7 @@ def generate_emergency_guidance(
     start = time.perf_counter()
     response = client.models.generate_content(
         model=_response_model,
-        contents=contents,
+        contents=user_content,   # plain string — correct for v3 text-only
         config=config,
     )
     latency = time.perf_counter() - start
@@ -290,7 +313,7 @@ def generate_emergency_guidance(
     return result, latency, in_tok, out_tok
 
 
-def validate_api_connection(api_key: str, model_id: str = "gemini-2.5-flash") -> bool:
+def validate_api_connection(api_key: str, model_id: str = "gemini-3.5-flash-lite") -> bool:
     """
     Perform a minimal connectivity check against the Gemini API.
     Returns True on success, raises on failure.
@@ -299,6 +322,6 @@ def validate_api_connection(api_key: str, model_id: str = "gemini-2.5-flash") ->
     response = test_client.models.generate_content(
         model=model_id,
         contents="Reply with the single word: OK",
-        config=genai_types.GenerateContentConfig(max_output_tokens=5),
+        config=genai_types.GenerateContentConfig(max_output_tokens=8),
     )
     return bool(response.text)

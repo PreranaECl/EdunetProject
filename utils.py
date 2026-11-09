@@ -400,12 +400,12 @@ def update_metrics_from_workflow(
             metrics.maps_api_calls += maps_result.get("api_calls", 0)
             point.maps_s = round(t, 3)
 
-    # Cost estimation — safe import in case groq_client not yet configured
+    # Cost estimation — safe import in case Gemini is not yet configured
     try:
-        from groq_client import _assessment_model, _response_model
+        from gemini_client import _assessment_model, _response_model
     except Exception:
-        _assessment_model = "llama-3.3-70b-versatile"
-        _response_model = "llama-3.3-70b-versatile"
+        _assessment_model = "gemini-2.0-flash-lite"
+        _response_model = "gemini-2.0-flash-lite"
     workflow_cost = (
         estimate_cost_usd(_assessment_model, point.input_tokens // 2, point.output_tokens // 2)
         + estimate_cost_usd(_response_model, point.input_tokens // 2, point.output_tokens // 2)

@@ -5,9 +5,9 @@ Uses the official `groq` Python SDK.
 Groq offers FREE inference — no payment method needed.
 Get a free API key at: https://console.groq.com
 
-Models used (stable, verified available on Groq free tier):
-  - Assessment Agent : llama-3.2-11b-vision-preview   (multimodal: text + image)
-  - Response Agent   : llama-3.3-70b-versatile         (text — best reasoning)
+Models used (current Groq replacements for deprecated names):
+  - Assessment Agent : openai/gpt-oss-120b
+  - Response Agent   : openai/gpt-oss-120b
 """
 
 from __future__ import annotations
@@ -28,8 +28,36 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _client: Optional[Groq] = None
-_assessment_model: str = "llama-3.2-11b-vision-preview"
-_response_model: str = "llama-3.3-70b-versatile"
+_assessment_model: str = "openai/gpt-oss-120b"
+_response_model: str = "openai/gpt-oss-120b"
+
+
+_DEFAULT_TEXT_MODEL = "openai/gpt-oss-120b"
+_DEFAULT_VISION_MODEL = "qwen/qwen3.6-27b"
+_VISION_CAPABLE_MODELS = {"qwen/qwen3.6-27b", "meta-llama/llama-4-scout-17b-16e-instruct", "meta-llama/llama-4-maverick-17b-128e-instruct"}
+
+
+_DEPRECATED_GROQ_MODELS = {
+    "llama-3.2-11b-vision-preview": _DEFAULT_VISION_MODEL,
+    "llama-3.2-90b-vision-preview": _DEFAULT_VISION_MODEL,
+    "llama-3.2-90b-text-preview": _DEFAULT_TEXT_MODEL,
+    "llama-3.3-70b-versatile": _DEFAULT_TEXT_MODEL,
+    "llama-3.1-8b-instant": _DEFAULT_TEXT_MODEL,
+    "meta-llama/llama-4-scout-17b-16e-instruct": _DEFAULT_VISION_MODEL,
+    "meta-llama/llama-4-maverick-17b-128e-instruct": _DEFAULT_VISION_MODEL,
+    "qwen/qwen3-32b": _DEFAULT_TEXT_MODEL,
+    "qwen/qwen3.6-27b": _DEFAULT_VISION_MODEL,
+}
+
+
+def _normalize_model_name(model_name: Optional[str], *, fallback: str = _DEFAULT_TEXT_MODEL) -> str:
+    cleaned = (model_name or fallback).strip()
+    if not cleaned:
+        return fallback
+    return _DEPRECATED_GROQ_MODELS.get(cleaned, cleaned)
+
+
+_FALLBACK_MODELS = ["qwen/qwen3.6-27b", "openai/gpt-oss-120b"]
 
 
 # ---------------------------------------------------------------------------
@@ -38,8 +66,8 @@ _response_model: str = "llama-3.3-70b-versatile"
 
 def configure_replicate(
     api_token: str,
-    assessment_model: str = "llama-3.2-11b-vision-preview",
-    response_model: str = "llama-3.3-70b-versatile",
+    assessment_model: str = "openai/gpt-oss-120b",
+    response_model: str = "openai/gpt-oss-120b",
 ) -> None:
     """
     Initialise the Groq client.
@@ -49,8 +77,8 @@ def configure_replicate(
     if not api_token or not api_token.strip():
         raise ValueError("Groq API key must not be empty.")
     _client = Groq(api_key=api_token.strip())
-    _assessment_model = (assessment_model or "llama-3.2-11b-vision-preview").strip()
-    _response_model = (response_model or "llama-3.3-70b-versatile").strip()
+    _assessment_model = _normalize_model_name(assessment_model, fallback=_DEFAULT_VISION_MODEL)
+    _response_model = _normalize_model_name(response_model, fallback=_DEFAULT_VISION_MODEL)
     logger.info(
         "Groq client configured. Assessment: %s | Response: %s",
         _assessment_model, _response_model,
@@ -170,6 +198,29 @@ def _image_to_data_uri(image_bytes: bytes, mime_type: str = "image/jpeg") -> str
 # Public inference functions  (same signatures as replicate_client.py)
 # ---------------------------------------------------------------------------
 
+def _chat_with_fallback(client: Groq, *, model: str, messages: list, max_tokens: int, temperature: float):
+    """Retry with a current Groq model if the configured one is unavailable."""
+    candidates = [model] + [m for m in _FALLBACK_MODELS if m != model]
+    last_error = None
+    for candidate in candidates:
+        try:
+            return client.chat.completions.create(
+                model=candidate,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as exc:  # pragma: no cover - error path exercised by runtime access
+            last_error = exc
+            message = str(exc).lower()
+            if "model_not_found" not in message and "does not exist" not in message and "no access" not in message and "decommissioned" not in message:
+                raise
+            logger.warning("Groq model %s unavailable; retrying with %s. Error: %s", model, candidate, exc)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"No Groq model could handle the request for {model}.")
+
+
 def analyze_emergency(
     emergency_type: str,
     description: str,
@@ -182,7 +233,7 @@ def analyze_emergency(
     Call the Emergency Assessment Agent via Groq.
 
     Returns (assessment_dict, latency_s, input_tokens, output_tokens).
-    When an image is provided, uses llama-3.2-11b-vision-preview (multimodal).
+    When an image is provided, uses the configured multimodal assessment model.
     When text-only, uses the configured assessment model.
     """
     client = _get_client()
@@ -193,8 +244,8 @@ def analyze_emergency(
         f"Description: {description}\n"
     )
 
-    if image_bytes:
-        # Vision model — send image as base64 data URI
+    normalized_model = _normalize_model_name(_assessment_model, fallback=_DEFAULT_TEXT_MODEL)
+    if image_bytes and normalized_model in _VISION_CAPABLE_MODELS:
         user_text += "An emergency image has been provided. Analyze it carefully.\n"
         content = [
             {"type": "text", "text": user_text},
@@ -203,11 +254,15 @@ def analyze_emergency(
                 "image_url": {"url": _image_to_data_uri(image_bytes, image_mime)},
             },
         ]
-        # Always use vision model when image is present
-        model_to_use = "llama-3.2-11b-vision-preview"
+        model_to_use = normalized_model
     else:
+        if image_bytes:
+            user_text += (
+                "\nNote: An image was uploaded, but the selected model only accepts text input. "
+                "Please rely on the provided emergency description and location for the assessment.\n"
+            )
         content = user_text
-        model_to_use = _assessment_model
+        model_to_use = normalized_model if normalized_model in _VISION_CAPABLE_MODELS else _DEFAULT_TEXT_MODEL
 
     messages = [
         {"role": "system", "content": ASSESSMENT_SYSTEM_PROMPT},
@@ -215,7 +270,8 @@ def analyze_emergency(
     ]
 
     start = time.perf_counter()
-    response = client.chat.completions.create(
+    response = _chat_with_fallback(
+        client,
         model=model_to_use,
         messages=messages,
         max_tokens=max_new_tokens,
@@ -261,7 +317,8 @@ def generate_emergency_guidance(
     ]
 
     start = time.perf_counter()
-    response = client.chat.completions.create(
+    response = _chat_with_fallback(
+        client,
         model=_response_model,
         messages=messages,
         max_tokens=max_new_tokens,
@@ -284,7 +341,7 @@ def generate_emergency_guidance(
 
 def validate_api_connection(
     api_token: str,
-    model_id: str = "llama-3.3-70b-versatile",
+    model_id: str = "openai/gpt-oss-120b",
 ) -> bool:
     """
     Quick connectivity check via a minimal Groq inference call.

@@ -1,7 +1,7 @@
 """
 tests/test_workflow.py — Integration-level tests for the two-agent workflow.
 
-All Groq API and Google Maps calls are mocked so no real credentials are needed.
+All Gemini API and Google Maps calls are mocked so no real credentials are needed.
 """
 
 import json
@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import groq_client as replicate_client   # alias for test compatibility
+import gemini_client as replicate_client
 import maps_service
 import agents
 from schemas import EmergencyAssessment, EmergencyResponse
@@ -75,19 +75,24 @@ def _fake_help_centers():
     ]
 
 
-def _make_fake_groq_response(data: dict) -> MagicMock:
-    """Build a mock Groq chat.completions.create() response."""
-    msg = MagicMock()
-    msg.content = json.dumps(data)
-    choice = MagicMock()
-    choice.message = msg
-    usage = MagicMock()
-    usage.prompt_tokens = 100
-    usage.completion_tokens = 200
+def _make_fake_gemini_response(data: dict) -> MagicMock:
+    """Build a mock Gemini generate_content() response."""
     resp = MagicMock()
-    resp.choices = [choice]
-    resp.usage = usage
+    resp.text = json.dumps(data)
+    resp.usage_metadata = MagicMock()
+    resp.usage_metadata.prompt_token_count = 100
+    resp.usage_metadata.candidates_token_count = 200
     return resp
+
+
+def test_gemini_configuration_uses_selected_models():
+    replicate_client.configure_gemini(
+        api_key="FAKE_GEMINI_KEY",
+        assessment_model="gemini-2.5-flash-lite",
+        response_model="gemini-2.5-flash",
+    )
+    assert replicate_client._assessment_model == "gemini-2.5-flash-lite"
+    assert replicate_client._response_model == "gemini-2.5-flash"
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -95,10 +100,10 @@ def _make_fake_groq_response(data: dict) -> MagicMock:
 @pytest.fixture(autouse=True)
 def configure_fake_apis():
     """Configure fake API clients before each test."""
-    replicate_client.configure_replicate(
-        api_token="FAKE_GROQ_KEY",
-        assessment_model="llama-3.2-11b-vision-preview",
-        response_model="llama-3.3-70b-versatile",
+    replicate_client.configure_gemini(
+        api_key="FAKE_GEMINI_KEY",
+        assessment_model="gemini-2.5-flash",
+        response_model="gemini-2.5-flash",
     )
     maps_service._enabled = True
     yield
@@ -107,10 +112,10 @@ def configure_fake_apis():
 # ── Assessment Agent tests ────────────────────────────────────────────────────
 
 class TestAssessmentAgent:
-    @patch("groq_client._client")
+    @patch("gemini_client._client")
     def test_successful_assessment(self, mock_client):
-        mock_client.chat.completions.create.return_value = (
-            _make_fake_groq_response(_mock_assessment_dict())
+        mock_client.models.generate_content.return_value = (
+            _make_fake_gemini_response(_mock_assessment_dict())
         )
 
         agent = agents.EmergencyAssessmentAgent()
@@ -126,12 +131,10 @@ class TestAssessmentAgent:
         assert record.status == "Completed"
         assert record.validation == "Passed"
 
-    @patch("groq_client._client")
+    @patch("gemini_client._client")
     def test_invalid_json_response_fails(self, mock_client):
-        msg = MagicMock(); msg.content = "This is not valid JSON at all."
-        choice = MagicMock(); choice.message = msg
-        bad = MagicMock(); bad.choices = [choice]; bad.usage = None
-        mock_client.chat.completions.create.return_value = bad
+        bad = MagicMock(); bad.text = "This is not valid JSON at all."; bad.usage_metadata = None
+        mock_client.models.generate_content.return_value = bad
 
         agent = agents.EmergencyAssessmentAgent()
         assessment, record = agent.run(
@@ -143,11 +146,11 @@ class TestAssessmentAgent:
         assert assessment is None
         assert record.status == "Failed"
 
-    @patch("groq_client._client")
+    @patch("gemini_client._client")
     def test_schema_validation_failure(self, mock_client):
         bad_data = {"agent": "Emergency Assessment Agent", "summary": "Bad schema"}
-        mock_client.chat.completions.create.return_value = (
-            _make_fake_groq_response(bad_data)
+        mock_client.models.generate_content.return_value = (
+            _make_fake_gemini_response(bad_data)
         )
 
         agent = agents.EmergencyAssessmentAgent()
@@ -167,10 +170,10 @@ class TestResponseAgent:
     def _valid_assessment(self) -> EmergencyAssessment:
         return EmergencyAssessment(**_mock_assessment_dict())
 
-    @patch("groq_client._client")
+    @patch("gemini_client._client")
     def test_successful_response(self, mock_client):
-        mock_client.chat.completions.create.return_value = (
-            _make_fake_groq_response(_mock_response_dict())
+        mock_client.models.generate_content.return_value = (
+            _make_fake_gemini_response(_mock_response_dict())
         )
 
         agent = agents.EmergencyResponseAgent()
@@ -197,13 +200,13 @@ class TestResponseAgent:
         assert response is None
         assert record.status == "Blocked"
 
-    @patch("groq_client._client")
+    @patch("gemini_client._client")
     def test_severity_mismatch_corrected(self, mock_client):
         """If response severity differs from assessment, it should be corrected."""
         resp_data = _mock_response_dict()
-        resp_data["severity_level"] = "Low"        # Mismatch: assessment is High
-        mock_client.chat.completions.create.return_value = (
-            _make_fake_groq_response(resp_data)
+        resp_data["severity_level"] = "Low"  # Mismatch: assessment is High
+        mock_client.models.generate_content.return_value = (
+            _make_fake_gemini_response(resp_data)
         )
 
         agent = agents.EmergencyResponseAgent()
@@ -222,17 +225,17 @@ class TestResponseAgent:
 class TestFullWorkflow:
     @patch("maps_service.requests.post")
     @patch("maps_service.requests.get")
-    @patch("groq_client._client")
+    @patch("gemini_client._client")
     def test_full_workflow_success(self, mock_groq, mock_maps_get, mock_maps_post):
         call_count = {"n": 0}
 
-        def groq_side_effect(*args, **kwargs):
+        def gemini_side_effect(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return _make_fake_groq_response(_mock_assessment_dict())
-            return _make_fake_groq_response(_mock_response_dict())
+                return _make_fake_gemini_response(_mock_assessment_dict())
+            return _make_fake_gemini_response(_mock_response_dict())
 
-        mock_groq.chat.completions.create.side_effect = groq_side_effect
+        mock_groq.models.generate_content.side_effect = gemini_side_effect
 
         def maps_get_side_effect(url, params=None, timeout=None, **kw):
             m = MagicMock()
@@ -269,12 +272,10 @@ class TestFullWorkflow:
 
     @patch("maps_service.requests.post")
     @patch("maps_service.requests.get")
-    @patch("groq_client._client")
+    @patch("gemini_client._client")
     def test_workflow_fails_on_assessment_error(self, mock_groq, mock_maps_get, mock_maps_post):
-        msg = MagicMock(); msg.content = "Not JSON"
-        choice = MagicMock(); choice.message = msg
-        bad = MagicMock(); bad.choices = [choice]; bad.usage = None
-        mock_groq.chat.completions.create.return_value = bad
+        bad = MagicMock(); bad.text = "Not JSON"; bad.usage_metadata = None
+        mock_groq.models.generate_content.return_value = bad
 
         result = agents.run_emergency_workflow(
             emergency_type="Medical Emergency",
@@ -288,20 +289,18 @@ class TestFullWorkflow:
 
     @patch("maps_service.requests.post")
     @patch("maps_service.requests.get")
-    @patch("groq_client._client")
+    @patch("gemini_client._client")
     def test_workflow_returns_partial_on_response_failure(self, mock_groq, mock_maps_get, mock_maps_post):
         call_count = {"n": 0}
 
-        def groq_side_effect(*args, **kwargs):
+        def gemini_side_effect(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return _make_fake_groq_response(_mock_assessment_dict())
-            msg = MagicMock(); msg.content = "invalid json"
-            choice = MagicMock(); choice.message = msg
-            bad = MagicMock(); bad.choices = [choice]; bad.usage = None
+                return _make_fake_gemini_response(_mock_assessment_dict())
+            bad = MagicMock(); bad.text = "invalid json"; bad.usage_metadata = None
             return bad
 
-        mock_groq.chat.completions.create.side_effect = groq_side_effect
+        mock_groq.models.generate_content.side_effect = gemini_side_effect
 
         def maps_get_side_effect(url, **kw):
             m = MagicMock()

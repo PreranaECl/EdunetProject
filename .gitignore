@@ -1,3 +1,14 @@
 
 # SQLite cross-session memory
 .data/
+
+# Environment secrets -- never commit real keys
+.env
+.env.local
+.env.*.local
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
